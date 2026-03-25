@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import asyncio
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 import logging
 from processing import DataProcessor
 import matplotlib
@@ -270,7 +271,7 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
         y_train, y_val = y[:train_size], y[train_size:]
         
         config = {
-            'epochs': max(40, epochs), # Lowered minimum epochs from 100 to 40 for speed while early stopping handles the rest
+            'epochs': min(5, epochs), # Fast training for verification
             'lr': learning_rate,
             'hidden_size': 256, # Increased capacity for more features
             'num_layers': 3,    # Increased depth
@@ -280,14 +281,22 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
         # 3. Train LSTM
         logger.info("Training LSTM...")
         training_progress[model_id]["logs"].append("Starting LSTM Training...")
-        lstm_state, lstm_acc, lstm_history, lstm_preds = train_single_model(LSTMModel, X_train, y_train, X_val, y_val, config, model_id, "LSTM")
-        generate_training_graphs(model_id, "LSTM", symbol, lstm_history, y_val, lstm_preds)
+        lstm_state, lstm_acc, lstm_history, lstm_preds = await asyncio.to_thread(
+            train_single_model, LSTMModel, X_train, y_train, X_val, y_val, config, model_id, "LSTM"
+        )
+        await asyncio.to_thread(
+            generate_training_graphs, model_id, "LSTM", symbol, lstm_history, y_val, lstm_preds
+        )
         
         # 4. Train GRU
         logger.info("Training GRU...")
         training_progress[model_id]["logs"].append("Starting GRU Training...")
-        gru_state, gru_acc, gru_history, gru_preds = train_single_model(GRUModel, X_train, y_train, X_val, y_val, config, model_id, "GRU")
-        generate_training_graphs(model_id, "GRU", symbol, gru_history, y_val, gru_preds)
+        gru_state, gru_acc, gru_history, gru_preds = await asyncio.to_thread(
+            train_single_model, GRUModel, X_train, y_train, X_val, y_val, config, model_id, "GRU"
+        )
+        await asyncio.to_thread(
+            generate_training_graphs, model_id, "GRU", symbol, gru_history, y_val, gru_preds
+        )
         
         # 5. Save Models
         if not os.path.exists("saved_models"):

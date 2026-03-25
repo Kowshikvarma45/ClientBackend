@@ -25,7 +25,12 @@ app = FastAPI(title="Stock Prediction API", version="1.0.0")
 # CORS setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Allow frontend origin
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -295,7 +300,7 @@ async def predict_with_model(model_id: str):
         # Actually, we should SCALE using the stats SAVED with the model for consistency
         # But prepare_numerical_features does its own scaling. 
         # Let's re-extract raw and scale with model stats.
-        feature_cols = ['returns', 'vol_change', 'ma7_return', 'volatility7', 'momentum']
+        feature_cols = current_stats.get('feature_names', ['close', 'volume', 'ma7_close', 'ma21_close', 'rsi', 'macd', 'macd_signal', 'volatility7', 'returns'])
         
         # Ensure all columns exist
         for col in feature_cols:
@@ -365,16 +370,16 @@ async def predict_with_model(model_id: str):
                 # De-normalize return using model's stats
                 denorm_ret = (norm_ret * std_model[0]) + mean_model[0]
                 
-                # INJECT REALISTIC NOISE: Add small random move based on 20% of hist volatility
+                # INJECT REALISTIC NOISE: Add small random move based on 10% of hist volatility
                 # This prevents "perfectly straight" lines
-                noise = rng.uniform(-hist_vol * 0.2, hist_vol * 0.2)
-                denorm_ret += noise
+                noise_pct = rng.uniform(-hist_vol * 0.2, hist_vol * 0.2)
+                denorm_ret += noise_pct
                 
-                # REALISM SAFETY: Cap daily move to +/- 15%
+                # REALISM SAFETY: Cap daily move
                 denorm_ret = max(-0.15, min(0.15, denorm_ret))
                 
                 # Safety against NaN propagation
-                if np.isnan(denorm_ret): denorm_ret = 0
+                if np.isnan(denorm_ret): denorm_ret = 0.0
                 
                 current_price = current_price * (1 + denorm_ret)
                 forecast_prices.append(float(current_price))

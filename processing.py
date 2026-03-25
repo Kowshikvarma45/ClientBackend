@@ -122,7 +122,7 @@ class DataProcessor:
     def prepare_numerical_features(self, df: pd.DataFrame) -> Tuple[np.ndarray, Dict]:
         """
         Prepares features for return-based model.
-        Adds technical indicators for better trend recognition.
+        Uses returns as the prediction target to ensure data is stationary.
         """
         # 1. Base Features
         if 'returns' not in df.columns:
@@ -130,25 +130,13 @@ class DataProcessor:
         if 'vol_change' not in df.columns:
             df['vol_change'] = df['volume'].pct_change()
             
-        # 2. Technical Indicators (Price, Trend, Momentum)
-        df['ma7_close'] = df['close'].rolling(window=7).mean()
-        df['ma21_close'] = df['close'].rolling(window=21).mean()
-        
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = exp1 - exp2
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        
+        # 2. Technical Indicators (Stationary)
+        df['ma7_return'] = df['close'].rolling(window=7).mean().pct_change()
         df['volatility7'] = df['returns'].rolling(window=7).std()
+        df['momentum'] = df['returns'].rolling(window=10).mean()
             
-        # Set `close` as index 0 (prediction target), add new features
-        feature_cols = ['close', 'volume', 'ma7_close', 'ma21_close', 'rsi', 'macd', 'macd_signal', 'volatility7', 'returns']
+        # Set `returns` as index 0 (prediction target)
+        feature_cols = ['returns', 'vol_change', 'ma7_return', 'volatility7', 'momentum']
         df = df.dropna(subset=feature_cols).reset_index(drop=True)
             
         if df.empty:
