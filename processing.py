@@ -134,9 +134,25 @@ class DataProcessor:
         df['ma7_return'] = df['close'].rolling(window=7).mean().pct_change()
         df['volatility7'] = df['returns'].rolling(window=7).std()
         df['momentum'] = df['returns'].rolling(window=10).mean()
-            
+        
+        # 3. New Features: RSI and MACD (Stationary forms)
+        # RSI calculation
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        # Avoid division by zero
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # MACD Histogram (Divergence between MACD and Signal is stationary)
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = macd - signal
+
         # Set `returns` as index 0 (prediction target)
-        feature_cols = ['returns', 'vol_change', 'ma7_return', 'volatility7', 'momentum']
+        feature_cols = ['returns', 'vol_change', 'ma7_return', 'volatility7', 'momentum', 'rsi', 'macd_hist']
         df = df.dropna(subset=feature_cols).reset_index(drop=True)
             
         if df.empty:

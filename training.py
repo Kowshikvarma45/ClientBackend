@@ -15,8 +15,10 @@ import matplotlib.pyplot as plt
 logger = logging.getLogger(__name__)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def generate_training_graphs(model_id, model_type, symbol, history, y_true, y_pred):
-    os.makedirs("saved_models", exist_ok=True)
+def generate_training_graphs(model_id, model_type, symbol, history, y_true, y_pred, graphs_folder=None, stats=None):
+    if graphs_folder is None:
+        graphs_folder = "saved_models"
+    os.makedirs(graphs_folder, exist_ok=True)
     
     # Loss vs Epochs
     plt.figure(figsize=(10, 5))
@@ -27,19 +29,43 @@ def generate_training_graphs(model_id, model_type, symbol, history, y_true, y_pr
     plt.ylabel("Loss")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig(f"saved_models/{model_id}_{model_type}_loss.png", bbox_inches='tight')
+    plt.savefig(f"{graphs_folder}/{model_id}_{model_type}_loss.png", bbox_inches='tight')
     plt.close()
 
     # Actual vs Predicted Plot
     plt.figure(figsize=(12, 6))
-    plt.plot(y_true, label='Actual Returns', color='blue', alpha=0.6)
-    plt.plot(y_pred, label='Predicted Returns', color='red', alpha=0.8, linestyle='--')
-    plt.title(f"{symbol} - {model_type} Actual vs Predicted Returns (Validation Set)")
+    
+    if stats is not None and 'std' in stats and 'mean' in stats:
+        # Unscale returns
+        std_ret = stats['std'][0]
+        mean_ret = stats['mean'][0]
+        
+        true_returns = (y_true * std_ret) + mean_ret
+        pred_returns = (y_pred * std_ret) + mean_ret
+        
+        # Build cumulative price index starting at Base=100
+        true_plot = 100 * np.cumprod(1 + true_returns)
+        pred_plot = 100 * np.cumprod(1 + pred_returns)
+        y_label = "Simulated Price Index"
+        title_suffix = "Cumulative Price Index (Validation Set)"
+        legend_true = "Actual Price Trend"
+        legend_pred = "Predicted Price Trend"
+    else:
+        true_plot = y_true
+        pred_plot = y_pred
+        y_label = "Scaled Returns"
+        title_suffix = "Actual vs Predicted Returns (Validation Set)"
+        legend_true = "Actual Returns"
+        legend_pred = "Predicted Returns"
+
+    plt.plot(true_plot, label=legend_true, color='blue', alpha=0.6)
+    plt.plot(pred_plot, label=legend_pred, color='red', alpha=0.8, linestyle='--')
+    plt.title(f"{symbol} - {model_type} {title_suffix}")
     plt.xlabel("Time Steps")
-    plt.ylabel("Scaled Returns")
+    plt.ylabel(y_label)
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig(f"saved_models/{model_id}_{model_type}_predictions.png", bbox_inches='tight')
+    plt.savefig(f"{graphs_folder}/{model_id}_{model_type}_predictions.png", bbox_inches='tight')
     plt.close()
 
 class LSTMModel(nn.Module):
@@ -107,7 +133,7 @@ def train_single_model(model_class, X_train, y_train, X_val, y_val, config, mode
     
     # Early stopping config
     patience_counter = 0
-    patience_limit = 8 # Reduced patience to stop faster on plateaus
+    patience_limit = 10 # Increased patience to 10 for better convergence
     
     # Use DataLoader for Mini-Batch Training to prevent OOM
     batch_size = 128 # Increased batch size for faster parallel processing
@@ -223,6 +249,11 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
     Background task to train separate LSTM and GRU models and update DB.
     """
     try:
+        import datetime
+        timestamp_str = datetime.datetime.now().strftime("%d-%m-%H-%M-%S")
+        graphs_folder = f"saved_models/{timestamp_str} ({symbol})"
+        os.makedirs(graphs_folder, exist_ok=True)
+        
         training_progress[model_id] = {
             "epoch": 0,
             "total_epochs": epochs,
@@ -249,7 +280,12 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
         if os.path.exists(symbol_data_path):
              try:
                  df = pd.read_csv(symbol_data_path)
-                 training_progress[model_id]["logs"].append(f"Using cached data for {symbol}")
+                 last_date = pd.to_datetime(df['date']).max().date()
+                 if last_date < (datetime.datetime.now().date() - datetime.timedelta(days=1)):
+                     df = None # force fetch
+                     training_progress[model_id]["logs"].append(f"Cached data out of date, fetching newer data for {symbol}")
+                 else:
+                     training_progress[model_id]["logs"].append(f"Using recent cached data for {symbol}")
              except:
                  df = None
         
@@ -271,11 +307,11 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
         y_train, y_val = y[:train_size], y[train_size:]
         
         config = {
-            'epochs': min(5, epochs), # Fast training for verification
+            'epochs': max(50, epochs), # Increased epochs to 50-100 as requested for actual training
             'lr': learning_rate,
             'hidden_size': 256, # Increased capacity for more features
             'num_layers': 3,    # Increased depth
-            'dropout': 0.4      # Increased dropout to prevent overfitting with larger model
+            'dropout': 0.3      # Reduced dropout to 0.3 to prevent overfitting
         }
         
         # 3. Train LSTM
@@ -285,7 +321,7 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
             train_single_model, LSTMModel, X_train, y_train, X_val, y_val, config, model_id, "LSTM"
         )
         await asyncio.to_thread(
-            generate_training_graphs, model_id, "LSTM", symbol, lstm_history, y_val, lstm_preds
+            generate_training_graphs, model_id, "LSTM", symbol, lstm_history, y_val, lstm_preds, graphs_folder, stats
         )
         
         # 4. Train GRU
@@ -295,7 +331,7 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
             train_single_model, GRUModel, X_train, y_train, X_val, y_val, config, model_id, "GRU"
         )
         await asyncio.to_thread(
-            generate_training_graphs, model_id, "GRU", symbol, gru_history, y_val, gru_preds
+            generate_training_graphs, model_id, "GRU", symbol, gru_history, y_val, gru_preds, graphs_folder, stats
         )
         
         # 5. Save Models
