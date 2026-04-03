@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException, Body, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 import os
 import logging
 import asyncpg
 import asyncio
+import json
 import numpy as np
 from dotenv import load_dotenv
 from processing import DataProcessor
@@ -503,25 +505,44 @@ async def get_models(x_user_id: str = Header(None)):
         logger.error(f"Get models error: {e}")
         return []
 
-@app.get("/models/{model_id}/progress")
-async def get_model_progress(model_id: str):
+@app.get("/models/{model_id}/stream-progress")
+async def stream_model_progress(model_id: str):
     """
-    Returns real-time training progress for a specific model.
+    Returns real-time training progress via Server-Sent Events (SSE).
     """
-    if model_id in training_progress:
-        return training_progress[model_id]
-    else:
-        # Check if model exists in DB to determine if it's pending, failed, or done
-        if not db_pool:
-             return {"status": "UNKNOWN"}
-             
-        async with db_pool.acquire() as connection:
-            row = await connection.fetchrow('SELECT status FROM "Model" WHERE id = $1', model_id)
+    async def event_stream():
+        last_epoch = -1
+        last_log_count = 0
+        while True:
+            if model_id in training_progress:
+                prog = training_progress[model_id]
+                # Send update if epoch changed, new logs, or status changed
+                if prog["epoch"] > last_epoch or len(prog["logs"]) > last_log_count or prog["status"] in ["COMPLETED", "FAILED", "READY"]:
+                    last_epoch = prog["epoch"]
+                    last_log_count = len(prog["logs"])
+                    yield f"data: {json.dumps(prog)}\n\n"
+                    
+                if prog["status"] in ["COMPLETED", "FAILED", "READY"]:
+                    break
+            else:
+                 # Check DB
+                 if db_pool:
+                     async with db_pool.acquire() as connection:
+                         row = await connection.fetchrow('SELECT status FROM "Model" WHERE id = $1', model_id)
+                     if row:
+                         yield f"data: {json.dumps({'status': row['status']})}\n\n"
+                         if row['status'] in ['READY', 'FAILED']:
+                             break
+                     else:
+                         yield f"data: {json.dumps({'status': 'NOT_FOUND', 'error': 'Model not found'})}\n\n"
+                         break
+                 else:
+                     yield f"data: {json.dumps({'status': 'UNKNOWN'})}\n\n"
+                     break
+                     
+            await asyncio.sleep(1) # check memory state every 1 second
             
-        if row:
-            return {"status": row['status']} # e.g. "READY", "FAILED"
-        else:
-             raise HTTPException(status_code=404, detail="Model not found")
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.get("/api/market/analyze")
 async def analyze_market(x_user_id: str = Header(None)):
