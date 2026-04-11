@@ -398,3 +398,87 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
                 await connection.execute("""
                     UPDATE "Model" SET status = 'FAILED' WHERE id = $1
                 """, model_id)
+
+async def finetune_model_task(model_id: str, symbol: str, db_pool):
+    """
+    Background task to fine-tune an existing model trained earlier.
+    """
+    try:
+        logger.info(f"Finetuning started: Updating {symbol} model weights.")
+        base_path = f"saved_models/{model_id}"
+        if not os.path.exists(f"{base_path}_lstm.pth"):
+             logger.warning(f"File not found for finetuning {model_id}")
+             return
+             
+        processor = DataProcessor(api_key="demo")
+        symbol_data_path = f"data/{symbol}_data.csv"
+        df, _, _ = await processor.fetch_data(symbol, "6mo")
+        df.to_csv(symbol_data_path, index=False)
+        
+        data_scaled, stats = processor.prepare_numerical_features(df)
+        seq_length = 60 
+        X, y = create_sequences(data_scaled, seq_length)
+        
+        # Using the last samples for fine-tuning
+        ft_size = min(len(X), 100)
+        X_ft = X[-ft_size:]
+        y_ft = y[-ft_size:]
+        
+        train_size = int(len(X_ft) * 0.8)
+        X_train, X_val = X_ft[:train_size], X_ft[train_size:]
+        y_train, y_val = y_ft[:train_size], y_ft[train_size:]
+        
+        config = {
+            'epochs': 10,
+            'lr': 0.0001,
+            'hidden_size': 256, 
+            'num_layers': 3,    
+            'dropout': 0.3      
+        }
+        
+        for m_type, MClass in [("LSTM", LSTMModel), ("GRU", GRUModel)]:
+            model_path = f"{base_path}_{m_type.lower()}.pth"
+            checkpoint = torch.load(model_path, weights_only=False)
+            conf = checkpoint.get('config', config)
+            input_size = X_train.shape[2]
+            
+            model = MClass(
+                input_size=input_size, 
+                hidden_size=conf.get('hidden_size', 256), 
+                num_layers=conf.get('num_layers', 3), 
+                dropout=conf.get('dropout', 0.3)
+            ).to(device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            criterion = nn.HuberLoss(delta=1.0)
+            optimizer = optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=1e-4)
+            
+            train_data = TensorDataset(torch.from_numpy(X_train).float(), torch.from_numpy(y_train).float())
+            train_loader = DataLoader(train_data, shuffle=True, batch_size=32)
+            
+            model.train()
+            for epoch in range(config['epochs']):
+                for X_batch, y_batch in train_loader:
+                    X_batch = X_batch.to(device)
+                    y_batch = y_batch.to(device)
+                    optimizer.zero_grad()
+                    outputs = model(X_batch)
+                    loss = criterion(outputs.squeeze(-1) if outputs.dim() > 1 else outputs, y_batch)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    
+            model.eval()
+            checkpoint['model_state_dict'] = model.state_dict()
+            checkpoint['mean'] = stats['mean']
+            checkpoint['std'] = stats['std']
+            torch.save(checkpoint, model_path)
+            
+        if db_pool:
+             async with db_pool.acquire() as connection:
+                  await connection.execute("""
+                       UPDATE "Model" SET "createdAt" = NOW() WHERE id = $1
+                  """, model_id)
+        logger.info(f"Finetuning completed for {symbol}.")
+    except Exception as e:
+        logger.error(f"Finetuning failed: {e}")

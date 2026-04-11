@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from processing import DataProcessor
 from inference import ModelInference
 from decision_engine import DecisionEngine
-from training import train_model_task, training_progress
+from training import train_model_task, training_progress, finetune_model_task
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -160,7 +160,19 @@ async def train_model(request: TrainRequest, background_tasks: BackgroundTasks, 
         if not db_pool:
             raise HTTPException(status_code=500, detail="Database not connected")
 
-        # 1. Create DB Record
+        # 1. Check if model already exists
+        async with db_pool.acquire() as connection:
+            existing_model = await connection.fetchrow("""
+                SELECT id FROM "Model" 
+                WHERE symbol = $1 AND "userId" = $2 AND status = 'READY'
+                LIMIT 1
+            """, request.symbol, x_user_id)
+            
+            if existing_model:
+                logger.info(f"Model already exists for {request.symbol}, skipping training.")
+                return {"status": "success", "message": f"Model for {request.symbol} is already trained.", "model_id": existing_model['id']}
+
+        # 2. Create DB Record
         import uuid
         model_id = str(uuid.uuid4()) 
         
@@ -255,7 +267,7 @@ async def delete_model(model_id: str, x_user_id: str = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/models/{model_id}/predict")
-async def predict_with_model(model_id: str):
+async def predict_with_model(model_id: str, background_tasks: BackgroundTasks):
     try:
         if not db_pool:
             raise HTTPException(status_code=500, detail="Database not connected")
@@ -269,6 +281,22 @@ async def predict_with_model(model_id: str):
             
         if row['status'] != 'READY':
              raise HTTPException(status_code=400, detail=f"Model is not ready (Status: {row['status']})")
+
+        from datetime import datetime, timezone
+        model_created = row['createdAt']
+        if model_created.tzinfo is None:
+             model_created = model_created.replace(tzinfo=timezone.utc)
+             
+        age_days = (datetime.now(timezone.utc) - model_created).days
+        
+        if age_days >= 7:
+             logger.info(f"Model {model_id} for {row['symbol']} is {age_days} days old. Spawning background fine-tuning task.")
+             background_tasks.add_task(
+                 finetune_model_task,
+                 model_id,
+                 row['symbol'],
+                 db_pool
+             )
 
         # 2. Load Model
         base_path = row['filePath']
