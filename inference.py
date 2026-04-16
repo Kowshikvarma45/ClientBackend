@@ -7,29 +7,43 @@ from transformers import BertTokenizer, BertForSequenceClassification, pipeline
 from typing import Dict, Any, List
 
 # Define models locally for inference matching training def
+class AttentionLayer(nn.Module):
+    def __init__(self, hidden_size):
+        super(AttentionLayer, self).__init__()
+        self.attention = nn.Linear(hidden_size, 1)
+
+    def forward(self, rnn_out):
+        weights = torch.softmax(self.attention(rnn_out), dim=1)
+        context = torch.sum(weights * rnn_out, dim=1)
+        return context
+
 class LSTMModel(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2, dropout=0.2):
+    def __init__(self, input_size=1, hidden_size=128, num_layers=2, dropout=0.3):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.attention = AttentionLayer(hidden_size)
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
         h0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
         c0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
         out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
+        context = self.attention(out)
+        out = self.fc(context)
         return out
 
 class GRUModel(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2, dropout=0.2):
+    def __init__(self, input_size=1, hidden_size=128, num_layers=2, dropout=0.3):
         super(GRUModel, self).__init__()
         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.attention = AttentionLayer(hidden_size)
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
         h0 = torch.zeros(self.gru.num_layers, x.size(0), self.gru.hidden_size).to(x.device)
         out, _ = self.gru(x, h0)
-        out = self.fc(out[:, -1, :])
+        context = self.attention(out)
+        out = self.fc(context)
         return out
 
 class ModelInference:

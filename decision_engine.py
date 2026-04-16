@@ -54,9 +54,9 @@ class DecisionEngine:
         if action == "STRONG BUY":
             description += "Technical models and news sentiment are both strongly positive, indicating a high-conviction buy opportunity."
         elif action == "STRONG SELL":
-            description += "Critical technical and sentiment indicators are aligned negatively, suggesting significant caution."
+            description += "Technical and sentiment indicators are aggressively negative. Strongly recommend an immediate SELL."
         elif action == "HOLD":
-            description += "Price forecasts and recent news show conflicting signals. It is recommended to wait for more clarity."
+            description += "Price forecasts and recent news show strictly conflicting signals. Firmly HOLD positions until clarity emerges."
         elif "Sentiment-Led" in action:
              description += "While technical price movement is sideways, heavy social/news sentiment is driving this recommendation."
         else:

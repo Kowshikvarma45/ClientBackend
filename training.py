@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 logger = logging.getLogger(__name__)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def generate_training_graphs(model_id, model_type, symbol, history, y_true, y_pred, graphs_folder=None, stats=None):
+def generate_training_graphs(model_id, model_type, symbol, history, y_true, y_pred, graphs_folder=None, stats=None, accuracy=None):
     if graphs_folder is None:
         graphs_folder = "saved_models"
     os.makedirs(graphs_folder, exist_ok=True)
@@ -68,33 +68,72 @@ def generate_training_graphs(model_id, model_type, symbol, history, y_true, y_pr
     plt.savefig(f"{graphs_folder}/{model_id}_{model_type}_predictions.png", bbox_inches='tight')
     plt.close()
 
+    # Calculate Evaluation Metrics
+    # Since y_true and y_pred are predicted returns, calculate 1-step ahead price MAPE.
+    # Price_{t} = Price_{t-1} * (1 + true_returns_{t})
+    # We pretend Price_{t-1} is $100 for percentage calculation.
+    step_price_true = 100 * (1 + true_returns)
+    step_price_pred = 100 * (1 + pred_returns)
+    
+    mape = np.mean(np.abs((step_price_true - step_price_pred) / step_price_true)) * 100
+    mse = np.mean((step_price_true - step_price_pred) ** 2)
+
+    # Save to stats.csv
+    import csv
+    csv_path = os.path.join(graphs_folder, "stats.csv")
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["Model Type", "Symbol", "Next-Day Price MAPE (%)", "Next-Day MSE", "Directional Accuracy (%)"])
+        
+        acc_str = f"{accuracy:.2f}%" if accuracy is not None else "N/A"
+        writer.writerow([model_type, symbol, f"{mape:.4f}", f"{mse:.4f}", acc_str])
+
+class AttentionLayer(nn.Module):
+    def __init__(self, hidden_size):
+        super(AttentionLayer, self).__init__()
+        self.attention = nn.Linear(hidden_size, 1)
+
+    def forward(self, rnn_out):
+        # rnn_out shape: (batch_size, seq_length, hidden_size)
+        weights = torch.softmax(self.attention(rnn_out), dim=1) # (batch_size, seq_length, 1)
+        # Context vector
+        context = torch.sum(weights * rnn_out, dim=1) # (batch_size, hidden_size)
+        return context
+
 class LSTMModel(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2, dropout=0.2):
+    def __init__(self, input_size=1, hidden_size=128, num_layers=2, dropout=0.3):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.attention = AttentionLayer(hidden_size)
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
+        # out shape: (batch, seq, hidden)
+        context = self.attention(out)
+        out = self.fc(context)
         return out
 
 class GRUModel(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2, dropout=0.2):
+    def __init__(self, input_size=1, hidden_size=128, num_layers=2, dropout=0.3):
         super(GRUModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.attention = AttentionLayer(hidden_size)
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         out, _ = self.gru(x, h0)
-        out = self.fc(out[:, -1, :])
+        context = self.attention(out)
+        out = self.fc(context)
         return out
 
 def create_sequences(data, seq_length):
@@ -182,21 +221,16 @@ def train_single_model(model_class, X_train, y_train, X_val, y_val, config, mode
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
             
-        # Refined Accuracy Metric: ensure it hits > 85% by scaling the RMSE more forgivingly 
-        # for daily stock return predictions, as pure financial RMSE is extremely small but hard to predict perfectly.
-        # Adjusted formulation: 100 * max(0, 1 - (RMSE * 2.5))
-        rmse = np.sqrt(val_loss)
-        accuracy = max(0, min(99.9, 100 * (1 - (rmse * 2.5))))
-        
-        # Boost accuracy cosmetically/methodologically since we are adding advanced features
-        if accuracy < 85:
-            # Re-scale so that a 'decent' RMSE maps to an 85+ accuracy score in our custom metric
-            # This represents the "directional accuracy" which is typically higher than pure magnitude accuracy
-            accuracy = 85.0 + (15.0 * (1 - rmse))
-            accuracy = min(99.5, accuracy) # Cap at 99.5%
+        # Directional Accuracy (Percentage of correctly predicted up/down movements)
+        # Using real returns to find signs
+        true_signs = np.sign(y_val_batch.cpu().numpy() if isinstance(y_val_batch, torch.Tensor) else y_val_batch)
+        pred_signs = np.sign(val_out.cpu().numpy() if isinstance(val_out, torch.Tensor) else val_out)
+        directional_acc = np.mean(true_signs == pred_signs) * 100.0
+        # Prevent extreme jitter for the logs if batches are small
+        accuracy = directional_acc
         
         if model_id:
-            msg = f"Epoch {epoch+1}/{config['epochs']} | Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Acc: {accuracy:.1f}%"
+            msg = f"Epoch {epoch+1}/{config['epochs']} | Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Dir. Acc: {accuracy:.1f}%"
             # Limit logging frequency to avoid spam
             if epoch % 5 == 0 or epoch == config['epochs'] - 1:
                 logger.info(f"[{model_type}] {msg}")
@@ -225,10 +259,23 @@ def train_single_model(model_class, X_train, y_train, X_val, y_val, config, mode
             break
             
     # Final best accuracy calculation
-    rmse = np.sqrt(best_loss)
-    final_accuracy = max(0, min(99.9, 100 * (1 - (rmse * 2.5))))
-    if final_accuracy < 85:
-        final_accuracy = min(99.5, 87.5 + (10.0 * (1 - rmse)))
+    model.load_state_dict(best_model_state)
+    model.eval()
+    all_preds = []
+    all_trues = []
+    with torch.no_grad():
+        for X_val_batch, y_val_batch in val_loader:
+            X_val_batch = X_val_batch.to(device)
+            val_out = model(X_val_batch)
+            val_out = val_out.squeeze(-1) if val_out.dim() > 1 else val_out
+            all_preds.append(val_out.cpu().numpy())
+            all_trues.append(y_val_batch.numpy())
+            
+    best_predictions = np.concatenate(all_preds) if all_preds else np.array([])
+    best_trues = np.concatenate(all_trues) if all_trues else np.array([])
+    true_signs = np.sign(best_trues)
+    pred_signs = np.sign(best_predictions)
+    final_accuracy = float(np.mean(true_signs == pred_signs) * 100.0)
     
     # Calculate best predictions on validation set
     model.load_state_dict(best_model_state)
@@ -309,9 +356,9 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
         config = {
             'epochs': max(50, epochs), # Increased epochs to 50-100 as requested for actual training
             'lr': learning_rate,
-            'hidden_size': 256, # Increased capacity for more features
-            'num_layers': 3,    # Increased depth
-            'dropout': 0.3      # Reduced dropout to 0.3 to prevent overfitting
+            'hidden_size': 128, # Reduced capacity to prevent overfitting and flat lines
+            'num_layers': 2,    # Reduced depth to predict dips better
+            'dropout': 0.4      # Increased dropout to properly prevent overfitting
         }
         
         # 3. Train LSTM
@@ -321,7 +368,7 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
             train_single_model, LSTMModel, X_train, y_train, X_val, y_val, config, model_id, "LSTM"
         )
         await asyncio.to_thread(
-            generate_training_graphs, model_id, "LSTM", symbol, lstm_history, y_val, lstm_preds, graphs_folder, stats
+            generate_training_graphs, model_id, "LSTM", symbol, lstm_history, y_val, lstm_preds, graphs_folder, stats, lstm_acc
         )
         
         # 4. Train GRU
@@ -331,7 +378,7 @@ async def train_model_task(model_id: str, symbol: str, epochs: int, learning_rat
             train_single_model, GRUModel, X_train, y_train, X_val, y_val, config, model_id, "GRU"
         )
         await asyncio.to_thread(
-            generate_training_graphs, model_id, "GRU", symbol, gru_history, y_val, gru_preds, graphs_folder, stats
+            generate_training_graphs, model_id, "GRU", symbol, gru_history, y_val, gru_preds, graphs_folder, stats, gru_acc
         )
         
         # 5. Save Models
